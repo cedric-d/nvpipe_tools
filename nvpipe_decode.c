@@ -14,6 +14,7 @@
 #include <pthread.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/timerfd.h>
 
 #include <NvPipe.h>
 
@@ -43,13 +44,14 @@ typedef struct {
 	int width;
 	int height;
 	int framerate;
-	bool auto_decode;
+	int delay;
 
 	// internal members
 	uint32_t raw_size;
 	uint32_t pitch_size;
 	NvPipe *decoder;
 	volatile bool end; // termination request for input and main threads
+	int timerfd;
 
 	S_Buffer buffers[BUFFER_COUNT];
 	pthread_mutex_t mutex;
@@ -65,14 +67,23 @@ enum {
 	ARG_WIDTH,
 	ARG_HEIGHT,
 	ARG_FRAMERATE,
+	ARG_DELAY,
 
 	ARG_EXTRA
 };
 
+static inline void normalize_time(struct timespec *ts)
+{
+	while (ts->tv_nsec >= 1000000000L) {
+		ts->tv_sec++;
+		ts->tv_nsec -= 1000000000L;
+	}
+}
+
 static bool parse_args(int argc, char *argv[], S_Params *params)
 {
-	if (argc < 5) {
-		fprintf(stderr, "Usage: %s h264|h265 WIDTH HEIGHT FRAMERATE\n", argv[0]);
+	if (argc < 6) {
+		fprintf(stderr, "Usage: %s h264|h265 WIDTH HEIGHT FRAMERATE DELAY\n", argv[0]);
 		return false;
 	}
 
@@ -90,6 +101,7 @@ static bool parse_args(int argc, char *argv[], S_Params *params)
 	params->width = atoi(argv[ARG_WIDTH]);
 	params->height = atoi(argv[ARG_HEIGHT]);
 	params->framerate = atoi(argv[ARG_FRAMERATE]);
+	params->delay = atoi(argv[ARG_DELAY]);
 	if (params->width <= 0 || params->height <= 0 || params->framerate <= 0) {
 		fprintf(stderr, "Bad input arguments specified\n");
 		return false;
@@ -287,6 +299,8 @@ static void *func_output(void *arg)
 {
 	S_Params *params = (S_Params*)arg;
 	struct timespec sent_ts, prev_ts;
+	uint64_t expires = 0;
+	bool timer_started = false;
 
 	// initialize the previous timestamp not to have big first interval
 	clock_gettime(CLOCK_REALTIME, &prev_ts);
@@ -303,6 +317,31 @@ static void *func_output(void *arg)
 		if (params->buffers[cur].rawsize == 0)
 			break;
 
+		// start the output timer on first frame
+		if (!timer_started && params->timerfd != -1) {
+			struct itimerspec its = {
+				.it_interval = {
+					.tv_sec = 0,
+					.tv_nsec = 1000000000UL / params->framerate
+				},
+				.it_value = {
+					.tv_sec = params->buffers[cur].cap_ts.tv_sec
+					          + (params->delay / 1000),
+					.tv_nsec = params->buffers[cur].cap_ts.tv_nsec
+					           + (1000000UL * (params->delay % 1000))
+				}
+			};
+			normalize_time(&its.it_interval);
+			normalize_time(&its.it_value);
+
+			if (timerfd_settime(params->timerfd, TFD_TIMER_ABSTIME, &its, NULL) == -1) {
+				perror("Failed to start output timer");
+				params->end = true;
+				goto end;
+			}
+			timer_started = true;
+		}
+
 		const uint64_t cap_ts = params->buffers[cur].cap_ts.tv_sec * UINT64_C(1000000000)
 		                         + params->buffers[cur].cap_ts.tv_nsec;
 		const uint64_t enc_ts = params->buffers[cur].enc_ts.tv_sec * UINT64_C(1000000000)
@@ -311,6 +350,19 @@ static void *func_output(void *arg)
 		                         + params->buffers[cur].recv_ts.tv_nsec;
 		const uint64_t dec_ts = params->buffers[cur].dec_ts.tv_sec * UINT64_C(1000000000)
 		                         + params->buffers[cur].dec_ts.tv_nsec;
+
+		// wait output time
+		if (params->timerfd != -1 && expires == 0) {
+			int res;
+			do {
+				res = read(params->timerfd, &expires, sizeof(expires));
+			} while (res == -1 && errno == EINTR);
+			if (res == -1) {
+				perror("Failed to wait for timer expiration");
+				params->end = true;
+				goto end;
+			}
+		}
 
 		// write the frame
 		uint32_t total = 0;
@@ -329,6 +381,13 @@ static void *func_output(void *arg)
 		} while (total < params->buffers[cur].rawsize);
 
 		clock_gettime(CLOCK_REALTIME, &sent_ts);
+
+		if (expires > 0) {
+			--expires;
+			if (expires > 0) {
+				fprintf(stderr, "%" PRIu64 " timer expirations lost\n", expires);
+			}
+		}
 
 		// print statistics
 		fprintf(stderr, "Frame %" PRIu64 ": "
@@ -362,6 +421,7 @@ int main(int argc, char *argv[])
 	S_Params params = {
 		.decoder = NULL,
 		.end = false,
+		.timerfd = -1,
 		.mutex = PTHREAD_MUTEX_INITIALIZER,
 		.cond_free = PTHREAD_COND_INITIALIZER,
 		.cond_read = PTHREAD_COND_INITIALIZER,
@@ -389,6 +449,15 @@ int main(int argc, char *argv[])
 		params.buffers[i].rawdata = malloc(params.raw_size);
 		if (!params.buffers[i].rawdata || !params.buffers[i].encdata) {
 			fprintf(stderr, "Failed to allocate buffers\n");
+			goto error;
+		}
+	}
+
+	// create the output timer
+	if (params.delay > 0 && params.framerate > 0) {
+		params.timerfd = timerfd_create(CLOCK_REALTIME, 0);
+		if (params.timerfd == -1) {
+			perror("Failed to create output timer");
 			goto error;
 		}
 	}
@@ -453,6 +522,8 @@ error:
 	// clean up
 	if (params.decoder)
 		NvPipe_Destroy(params.decoder);
+	if (params.timerfd != -1)
+		close(params.timerfd);
 	for (int i = 0; i < BUFFER_COUNT; ++i) {
 		free(params.buffers[i].rawdata);
 		free(params.buffers[i].encdata);
